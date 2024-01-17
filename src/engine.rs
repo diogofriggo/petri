@@ -1,130 +1,293 @@
-use std::collections::VecDeque;
+use crate::error::Result;
+use crate::model::{ActiveEvent, FeedingNode, Net, PassiveEvent, Transition};
+use crate::tcp;
+use glob::glob;
+use std::collections::HashMap;
+use std::hash::Hash;
 
-use crate::polyfill::Lefs;
-use chrono::prelude::*;
-
-#[derive(Debug)]
 pub struct Engine {
-    pub cycle: usize,
-    pub lefs: Lefs,
-    pub events: VecDeque<Event>,
-    pub logs: Vec<Log>,
-    pub event_count: usize,
+    pub clock: usize,
+    pub step: usize,
+    net: Net,
+    last_clock: usize,
+    fed_nodes: Vec<String>,
+    feeding_nodes: Vec<FeedingNode>,
+    transition2node: HashMap<usize, String>,
+    events: Vec<ActiveEvent>,
 }
 
 impl Engine {
-    pub fn new(lefs: Lefs) -> Self {
-        Engine {
-            cycle: 0,
-            lefs,
-            events: VecDeque::new(),
-            logs: vec![],
-            event_count: 0,
-        }
-    }
+    pub fn new(last_clock: usize, node: String, nodes: &[&str], nets_folder: &str) -> Result<Self> {
+        let mut nodes = nodes.to_vec();
+        nodes.sort();
+        nodes.dedup();
 
-    // SimularPeriodo
-    pub fn simulate(&mut self, first_cycle: usize, last_cycle: usize) {
-        let start = Utc::now();
-        self.cycle = first_cycle;
+        let pattern = format!("{nets_folder}/*.json");
+        let mut paths = glob(&pattern)?
+            .filter_map(std::result::Result::ok)
+            // .map(|path| path.display().to_string())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
 
-        for _ in first_cycle..last_cycle {
-            println!("RELOJ LOCAL !!!  = {}", self.cycle);
-            println!("{}", self.lefs);
-            // simularUnpaso
-            self.step(last_cycle);
-        }
+        let nets = paths
+            .iter()
+            .map(Net::new)
+            .filter_map(std::result::Result::ok)
+            .collect::<Vec<_>>();
 
-        println!("event_count: {}", self.event_count);
-        let elapsed = Utc::now() - start;
-        println!(
-            "elapsed: {:?} microseconds",
-            elapsed.num_nanoseconds().unwrap() / 1000
+        assert!(!nets.is_empty(), "No nets found at {}", nets_folder);
+        assert!(!nodes.is_empty(), "No nodes provided");
+        assert!(
+            nets.len() == nodes.len(),
+            "Number of nets differs from number of nodes"
         );
-    }
 
-    // simularUnpaso
-    fn step(&mut self, last_cycle: usize) {
-        // actualizaSensibilizadas
-        self.pep();
+        let index = nodes.iter().position(|n| n == &node).unwrap();
+        let net = nets[index].clone();
 
-        println!("-----------Stack de transiciones sensibilizadas---------");
-        println!("{:?}", self.lefs.estimulated_transition_indices);
-        println!("-----------Final Stack de transiciones---------");
-
-        while let Some(estimulated_transition_index) =
-            self.lefs.estimulated_transition_indices.pop()
-        {
-            self.fire(estimulated_transition_index);
-            self.logs.push(Log {
-                estimulated_transition_index,
-                cycle: self.cycle,
+        let transition2node = nets
+            .iter()
+            .zip(nodes.iter())
+            .flat_map(|(net, &node)| {
+                net.transitions
+                    .iter()
+                    .map(|transition| (transition.id, node.into()))
             })
-        }
+            .collect::<HashMap<usize, String>>();
 
-        println!("-----------Lista eventos después de disparos---------");
-        println!("Estructura EventList");
-        for (i, event) in self.events.iter().enumerate() {
-            println!("  Evento -> {i}");
-            println!("{event}");
-        }
-        println!("-----------Final lista eventos---------");
+        let node2fed_nodes: HashMap<String, Vec<String>> =
+            nets.iter().fold(HashMap::new(), |mut acc, net| {
+                net.transitions.iter().for_each(|transition| {
+                    let node = transition2node[&transition.id].clone();
+                    transition
+                        .delayed_instructions
+                        .iter()
+                        .filter(|instruction| instruction.is_external)
+                        .for_each(|instruction| {
+                            let fed_node = transition2node[&instruction.transition_id].clone();
+                            acc.entry(node.clone()).or_default().push(fed_node);
+                        });
+                });
+                acc
+            });
 
-        self.cycle = if let Some(event) = self.events.front() {
-            event.cycle
-        } else {
-            last_cycle
+        let node2feeding_nodes = reverse(&node2fed_nodes);
+        let feeding_nodes = node2feeding_nodes[&node]
+            .iter()
+            .map(|feeding_node| FeedingNode {
+                name: feeding_node.clone(),
+                clock: 0,
+            })
+            .collect::<Vec<_>>();
+
+        let engine = Self {
+            clock: 0,
+            step: 1,
+            net,
+            last_clock,
+            fed_nodes: node2fed_nodes[&node].clone(),
+            feeding_nodes,
+            transition2node,
+            events: vec![],
         };
-        println!("NEXT CLOCK...... : {}", self.cycle);
 
-        self.aftermath();
+        Ok(engine)
     }
 
-    fn pep(&mut self) {
-        for (i, transition) in self.lefs.transitions.iter().enumerate() {
-            if transition.constant <= 0 && transition.cycle == self.cycle {
-                self.lefs.estimulated_transition_indices.push(i)
+    pub fn run(&mut self) -> Result<()> {
+        while self.clock < self.last_clock {
+            let clock = self.clock;
+
+            self.net
+                .transitions
+                .clone()
+                .iter()
+                .filter(|transition| transition.clock == clock && transition.value <= 0)
+                .rev() // to simulate a stack
+                .for_each(|transition| {
+                    self.process_immediate_instructions(transition);
+                    self.process_internal_delayed_instructions(transition);
+                    self.process_external_delayed_instructions(transition);
+                });
+
+            self.tick();
+            self.handle_events();
+        }
+
+        Ok(())
+    }
+
+    fn process_immediate_instructions(&mut self, transition: &Transition) {
+        transition
+            .immediate_instructions
+            .iter()
+            .for_each(|instruction| {
+                self.net.transitions[instruction.transition_id].value = instruction.value;
+            });
+    }
+
+    fn process_internal_delayed_instructions(&mut self, transition: &Transition) {
+        let mut events = transition
+            .delayed_instructions
+            .iter()
+            .filter(|instruction| !instruction.is_external)
+            .map(|instruction| ActiveEvent {
+                transition_id: instruction.transition_id,
+                value: instruction.value,
+                clock: transition.clock + transition.duration,
+            })
+            .collect::<Vec<_>>();
+
+        self.events.append(&mut events);
+    }
+
+    fn process_external_delayed_instructions(&self, transition: &Transition) {
+        self.fed_nodes
+            .iter()
+            .map(|fed_node| {
+                let fed_node = fed_node.clone();
+                let maybe_instruction = transition
+                    .delayed_instructions
+                    .iter()
+                    .filter(|instruction| instruction.is_external)
+                    .find(|instruction| {
+                        let destination_node =
+                            self.transition2node[&instruction.transition_id].clone();
+                        destination_node == fed_node
+                    });
+
+                let event: &[u8] = match maybe_instruction {
+                    Some(instruction) => ActiveEvent {
+                        transition_id: instruction.transition_id,
+                        value: instruction.value,
+                        clock: transition.clock + transition.duration,
+                    }
+                    .into(),
+                    None => PassiveEvent {
+                        clock: self.clock + self.step,
+                    }
+                    .into(),
+                };
+
+                (fed_node.clone(), event)
+            })
+            .for_each(|(destination_node, event): (String, &[u8])| {
+                tcp::send(&destination_node, event);
+            });
+    }
+
+    fn tick(&mut self) {
+        let earliest_clock = self
+            .events
+            .iter()
+            .map(|event| event.clock)
+            .chain(
+                self.feeding_nodes
+                    .iter()
+                    .map(|feeding_node| feeding_node.clock),
+            )
+            .min()
+            .unwrap_or(self.clock);
+
+        for feeding_node in self.feeding_nodes.iter_mut() {
+            if feeding_node.clock == earliest_clock {
+                // I cannot block on a single channel, rather block on all of them together
+                // for message in feeding_node.channel {
+                //
+                // }
+                // wait on channel, that is, block until we have either an active or passive message
             }
+            // then here he goes on to read any remaining event without blocking
         }
+
+        self.clock = self
+            .events
+            .iter()
+            .map(|event| event.clock)
+            .min()
+            .unwrap_or(self.clock + self.step);
     }
 
-    // dispararTransicion
-    fn fire(&mut self, estimulated_transition_index: usize) {
-        let transition = self.lefs.transitions[estimulated_transition_index].clone();
+    // func (se *SimulationEngine) forwardTime() Clock {
+    // 	var lowerBoundClock Clock
+    //
+    // 	// Initial min time is first event clock
+    // 	if lowerBoundClock = se.eventList.firstEventClock(); lowerBoundClock == -1 {
+    // 		lowerBoundClock = se.clock
+    // 	}
+    //
+    // 	// If any waiting segment has a lower clock set as minTime
+    // 	for _, v := range se.waitingOnSegments {
+    // 		if v.clock < lowerBoundClock {
+    // 			lowerBoundClock = v.clock
+    // 		}
+    // 	}
+    //
+    // 	// Wait for the lowest clock segments wither by event, or by lookahead
+    // 	for _, v := range se.waitingOnSegments {
+    // 		if v.clock == lowerBoundClock {
+    // 			select {
+    // 			case clock := <-v.lookahead:
+    // 				v.clock = clock
+    // 			case event := <-v.eventQueue:
+    // 				se.eventList.insert(event)
+    // 			}
+    // 		}
+    // 	Loop:
+    // 		for {
+    // 			select {
+    // 			case event := <-v.eventQueue:
+    // 				se.eventList.insert(event)
+    // 			default:
+    // 				break Loop
+    // 			}
+    // 		}
+    // 	}
+    //
+    // 	if lowerBoundClock = se.eventList.firstEventClock(); lowerBoundClock == -1 {
+    // 		lowerBoundClock = se.clock + se.lookahead
+    // 	}
+    //
+    // 	return lowerBoundClock
+    // }
 
-        for payload in &transition.iul_payloads {
-            self.lefs.transitions[payload.transition_index].constant += payload.constant;
-        }
+    fn handle_events(&mut self) {
+        // below events are ordered from lowest clock to highest clock,
+        // but if we always handle events for the current clock then there's no need to do any sorting
+        // self.events.sort_by(|a, b| a.clock.cmp(&b.clock));
 
-        let cycle = transition.cycle + transition.duration;
-        for payload in &transition.pul_payloads {
-            let event = Event {
-                cycle,
-                transition_index: payload.transition_index,
-                constant: payload.constant,
-            };
-            self.events.push_front(event);
-        }
-    }
+        self.events
+            .iter()
+            .filter(|event| event.clock == self.clock)
+            .for_each(|event| {
+                if let Some(transition) = &mut self
+                    .net
+                    .transitions
+                    .iter_mut()
+                    .find(|transition| transition.id == event.transition_id)
+                {
+                    transition.clock = event.clock;
+                    transition.value = event.value;
+                }
+            });
 
-    fn aftermath(&mut self) {
-        while let Some(event) = self.events.pop_front() {
-            self.lefs.transitions[event.transition_index].constant += event.constant;
-            self.lefs.transitions[event.transition_index].cycle = event.cycle;
-            self.event_count += 1;
-        }
+        self.events.retain(|event| event.clock != self.clock);
     }
 }
 
-#[derive(Debug)]
-pub struct Event {
-    pub cycle: usize,
-    pub transition_index: usize,
-    pub constant: isize,
-}
+fn reverse<K, V>(input: &HashMap<K, Vec<V>>) -> HashMap<V, Vec<K>>
+where
+    K: Eq + Hash + Clone,
+    V: Eq + Hash + Clone,
+{
+    let mut output: HashMap<V, Vec<K>> = HashMap::new();
 
-#[derive(Debug)]
-pub struct Log {
-    pub estimulated_transition_index: usize,
-    pub cycle: usize,
+    for (key, values) in input {
+        for value in values {
+            output.entry(value.clone()).or_default().push(key.clone());
+        }
+    }
+
+    output
 }

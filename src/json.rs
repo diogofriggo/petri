@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug)]
-pub struct Lefs {
+pub struct Net {
     pub ia_red: Vec<Transition>,
 }
 
@@ -13,11 +13,10 @@ pub struct Transition {
     pub ii_duracion_disparo: usize,
 
     #[serde(rename = "ii_listactes_IUL")]
-    pub ii_listactes_iul: Vec<Payload>,
+    pub ii_listactes_iul: Vec<(isize, isize)>,
 
     #[serde(rename = "ii_listactes_PUL")]
-    pub ii_listactes_pul: Vec<Payload>,
-}
+    pub ii_listactes_pul: Vec<(isize, isize)>,
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub struct Payload(pub usize, pub isize);
+    pub ib_desalida: bool,
+}

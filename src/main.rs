@@ -1,22 +1,42 @@
-// let path = r"/home/diogo/gounizar/redes/Practica2/MiniproyectoSD/CodigoSuministradoAAlumnos/simuladores/distconssim/testdata/3subredes.subred0.json";
-// let path = r"/home/diogo/gounizar/redes/Practica2/MiniproyectoSD/CodigoSuministradoAAlumnos/simuladores/distconssim/testdata/3subredes.subred1.json";
-// let path = r"/home/diogo/gounizar/redes/Practica2/MiniproyectoSD/CodigoSuministradoAAlumnos/simuladores/distconssim/testdata/3subredes.subred2.json";
 mod engine;
 mod error;
 mod json;
 mod model;
-mod tcp;
+
+use std::path::PathBuf;
 
 use error::Result;
 
 use crate::engine::Engine;
+use clap::Parser;
+
+#[derive(Parser, Debug)]
+struct Args {
+    /// Last simulation clock    
+    #[arg(long)]
+    terminal_clock: usize,
+
+    // Executing node ip:port address
+    #[arg(long)]
+    node: String,
+
+    // List of all ip:port addresses that will take part in the simulation
+    #[arg(long, num_args = 1..)]
+    nodes: Vec<String>,
+
+    /// Folder with .json Petri nets    
+    #[arg(long)]
+    nets_folder: PathBuf,
+}
 
 fn main() -> Result<()> {
-    // TODO: CLI inputs
-    let last_clock = 3;
-    let node = "127.0.0.1:1";
-    let nodes = ["127.0.0.1:1", "127.0.0.1:2", "127.0.0.1:3"];
-    let nets_folder = "/home/diogo/gounizar/redes/Practica2/MiniproyectoSD/CodigoSuministradoAAlumnos/simuladores/distconssim";
-    let mut engine = Engine::new(last_clock, node.into(), &nodes, nets_folder)?;
+    let args = Args::parse();
+
+    let mut engine = Engine::new(
+        args.terminal_clock,
+        args.node,
+        &args.nodes,
+        &args.nets_folder,
+    )?;
     engine.run()
 }

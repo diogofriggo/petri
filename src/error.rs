@@ -7,6 +7,9 @@ pub enum AppError {
     Io(std::io::Error),
     SerdeJson(serde_json::Error),
     Glob(glob::PatternError),
+    Recv(std::sync::mpsc::RecvError),
+    TryRecv(std::sync::mpsc::TryRecvError),
+    AddrParse(std::net::AddrParseError),
 }
 
 impl Error for AppError {}
@@ -17,6 +20,9 @@ impl Display for AppError {
             Self::Io(error) => write!(f, "{}", error),
             Self::SerdeJson(error) => write!(f, "{}", error),
             Self::Glob(error) => write!(f, "{}", error),
+            Self::Recv(error) => write!(f, "{}", error),
+            Self::TryRecv(error) => write!(f, "{}", error),
+            Self::AddrParse(error) => write!(f, "{}", error),
         }
     }
 }
@@ -36,5 +42,23 @@ impl From<serde_json::Error> for AppError {
 impl From<glob::PatternError> for AppError {
     fn from(value: glob::PatternError) -> Self {
         AppError::Glob(value)
+    }
+}
+
+impl From<std::sync::mpsc::RecvError> for AppError {
+    fn from(value: std::sync::mpsc::RecvError) -> Self {
+        AppError::Recv(value)
+    }
+}
+
+impl From<std::sync::mpsc::TryRecvError> for AppError {
+    fn from(value: std::sync::mpsc::TryRecvError) -> Self {
+        AppError::TryRecv(value)
+    }
+}
+
+impl From<std::net::AddrParseError> for AppError {
+    fn from(value: std::net::AddrParseError) -> Self {
+        AppError::AddrParse(value)
     }
 }
